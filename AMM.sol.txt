@@ -1,0 +1,212 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.7;
+
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+
+// AMM is a contract that allows to swap between token0 and token1
+// The caller must have approved the GassLessTransfer contract to transfer its tokens (AMM will use transferFrom)
+
+/****** All my comments are preceeded with `0Kage:` to separate from comments already existing in this file *******/
+
+// 0Kage : To improve code readability, I renamed interface from AMM to IAMM
+interface IAMM{
+    // Swap amount0 of token0 for token1
+    function swapExactAmount0In(uint amount0) external;
+}
+
+
+// Users can deposit token0 to this contract and wait for a relayer to do swap for token1
+contract GassLessTransfer is ReentrancyGuard{
+
+    IAMM amm;
+    IERC20 token0;
+    IERC20 token1;
+
+    mapping(address => uint) balances0;
+    mapping(address => uint) balances1;
+
+    constructor(IAMM amm_param, IERC20 t0, IERC20 t1){
+        require(address(amm_param) != address(0), "AMM address invalid"); // 0Kage: Added error msgs 
+        require(address(t0) != address(0), "Token0 address invalid"); // 0Kage: Added error msgs
+        require(address(t1) != address(0), "Token1 address invalid"); // 0Kage: Added error msgs
+        
+        amm = amm_param;
+        token0 = t0;
+        token1 = t1;
+
+        // Unlimited approve of the amm for token0
+        // This is needed for the swaps
+        token0.approve(address(amm_param), 2**256-1); // 0kage - checked docs on approve, this seems to be infinite approval - looks OK
+    }
+
+   
+
+    // User can deposit their token0
+    function deposit(uint amount) external nonReentrant {
+
+         /** -----0kage comments-----
+         * transferFrom of ERC20 expects 
+         *  -  to and from are not zero address
+         *  -  from must have minimum balance of `amount`
+         *  -  caller must have allowance of atleast the deposit amount
+         * 
+         * None of these checks are present at the moment -> added error checks for all the above
+         */
+
+        // 0Kage: Added Amount > 0 validation
+        require(amount > 0, "Invalid token amount to swap"); 
+
+        // 0Kage: msg.sender cannot be 0 address
+        require(msg.sender != address(0), "sender is zero address");
+
+        // 0Kage: Checking if user has sufficient balance to deposit
+        uint256 balance = token0.balanceOf(msg.sender);        
+        require(amount <= balance, "Deposit exceeds user balance");
+
+        // 0Kage: Checking if amount is within approved allowance for spender(this address)
+        uint256 approvedAllowance = token0.allowance(msg.sender, address(this));
+        require(amount <= approvedAllowance, "Deposit exceeds approved allowance");
+
+        //0Kage - added error check for transferFrom
+        //0Kage - balance is only updated when success = true
+        bool success = token0.transferFrom(msg.sender, address(this), amount);
+        require(success, "token0 transfer from user failed");
+
+        balances0[msg.sender] += amount;
+    }
+
+    // User can withdraw their token0 and token1
+    // We follow the check effect interaction pattern
+
+    /**
+     * 0kage - since below function involves transfers and balance mapping readjustment..
+     * .. even though check effect interaction pattern is followed..
+     * .. I have still used nonReentrant modifier as a best practice 
+     */
+    function withdraw(uint amount0, uint amount1) external nonReentrant {
+        
+         /** -----0kage comments-----
+         * withdraw function uses ERC20 'transfer' - does not have checks for following 
+         *  -  this address must have atleast amount0 and amount1 in their balances
+         *  -  msg.sender cannot be 0 address
+         *  - amount0 <= balances0[msg.sender] && amount1 <= balances1[msg.sender]
+         * None of these checks are present at the moment -> added error checks for all the above
+         */
+
+        uint256 token0Balance = token0.balanceOf(address(this));
+        uint256 token1Balance = token1.balanceOf(address(this));
+
+        // 0kage - checking token 0 balance
+        require(token0Balance >= amount0, "withdraw amount > token 0 balance");
+
+        // 0kage - checking token 1 balance
+        require(token1Balance >= amount1, "withdraw amount > token 1 balance");
+
+        // 0kage - check if token0 amount is valid
+        require(amount0 <= balances0[msg.sender], "invalid withdraw amount - token 0" );
+
+        // 0kage - check if token1 amount is valid
+        require(amount1 <= balances1[msg.sender], "invalid withdraw amount - token 1" );
+
+        // 0kage - checking if msg.sender is 0 address 
+        require(msg.sender != address(0), "msg.sender == null address");
+
+        balances0[msg.sender] -= amount0;
+        balances1[msg.sender] -= amount1;
+
+        // address error messages
+        bool success0 = token0.transfer(msg.sender, amount0);
+        bool success1 = token1.transfer(msg.sender, amount1);
+        require(success0 && success1, "withdrawal of tokens failed");
+    }
+
+    // User can withdraw all their token0 and token1
+    // nonReentrant to protect from reentrancies
+    function withdrawAll() external nonReentrant {
+
+        /** -----0kage comments-----
+         * contract assumes that token deposits and withdrawals always happen using deposit() and withdraw()
+         * this might not be the case - tokens can be directly deposited to this address or withdrawn from this address ...
+         * in such cases balances0 and balances1 need not be a true reflection of tokens balances in GasLessTransfer contract
+         * adding a check that token balances in address should be atleast equal to balance mapping for sender
+         * since `transfer` is used, making sure msg.sender is not 0 address
+         */
+
+        require(token0.balanceOf(address(this)) >= balances0[msg.sender], "token0 withdraw amount exceeds balance" );
+        require(token1.balanceOf(address(this)) >= balances1[msg.sender], "token1 withdraw amount exceeds balance" );
+        require(msg.sender != address(0), "user is 0 address"); 
+
+
+        /**
+         * ----0kage comments----
+         * Although Reentrancy Guard is used for this function, as a best practice,
+         * I've moved the two lines below adjusting balances0 and balances1 before actual transfers
+         * This is just to be inline with check effect interaction pattern
+         */
+        balances0[msg.sender] = 0;
+        balances1[msg.sender] = 0;
+        
+        bool success0 = token0.transfer(msg.sender, balances0[msg.sender]);
+        bool success1 = token1.transfer(msg.sender, balances1[msg.sender]);
+
+        require(success0 && success1, "withdraw transfers failed");    
+
+    }
+
+    // Allow anyone to exchange some of of the token0 for token1
+    // tokenToReceive is here to prevent sandwich attack
+    // nonReentrant to protect from reentrancies
+    function swapToken0toToken1(address from, uint tokenToReceive) external nonReentrant {
+
+        /**
+         * 0kage comments
+         * this is a vulnerability -  anyone without tokens can swap token0 for token1 of any other user
+         * since we have given infinite allowance to amm contract in line 42, I can practically empty all token0
+         * of any user and convert them into token 1 - this way I can manipulate price of token0/token1 in AMM
+         * and drain the AMM pool by arbitraging
+         * To prevent this, I am checking if msg.sender == 'from' address
+         */
+
+        require(msg.sender == from, "Sender not authorized to swap tokens of another user");
+
+        uint balance0 = balances0[from];
+
+        // balance1_before is used for slippage protection
+        uint balance1_before = token1.balanceOf(address(this));
+
+        amm.swapExactAmount0In(balance0);
+
+        // Check the slippage
+        uint balance1_after = token1.balanceOf(address(this));
+        // 0kage - user is swapping token0 for token1 -> token1 balance for user must increase
+        // 0Kage - condition commented below was the opposite; shows that token1 balance reduces
+        // commented this line & inserted my correction
+
+        // require(balance1_after > balance1_before - tokenToReceive);
+
+        require(balance1_after >= balance1_before + tokenToReceive, "Transaction exceeds slippage"); //0kage
+
+        /**
+         * --- 0Kage comments ---
+         * Above condition only puts a floor on the token1 balance
+         * Meaning, balances1[from] can be > tokenToReceive (when slippage < user specified limit)
+         */
+        
+        // Remove the user balance
+        balances0[from] = 0;
+
+        // Add the new token to the destination
+        /**
+         * --0kage comments ---
+         * Formula given below is commented - find 2 errors in this
+         * 1. token 0 is swapped to token 1 -> so if user already had some token1 balance, it needs to be added to existing (replaced = to += in formula)
+         * 2. As I understand, minimum expected after slippage = tokenToReceive. token1 received could be greater than minimum. To get exact, I used used balance_after - balance_before
+         */
+        // balances1[from] = tokenToReceive;
+        balances1[from] += balance1_after - balance1_before; //0Kage - fixed this formula
+    }
+
+}
